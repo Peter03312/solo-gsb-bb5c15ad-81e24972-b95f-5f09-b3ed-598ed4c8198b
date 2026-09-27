@@ -25,6 +25,12 @@ A 类标准不确定度 $u_A$（修正序列自相关对朴素 $s/\sqrt n$ 的�
 $u_A$、各滞后 $\gamma_k$ 与有效样本量 $n_{\mathrm{eff}}$；$u_A$ 可直接填入
 `/api/v1/propagate` 的 `standard_uncertainty`。
 
+另提供**校准修正（线性插值）**接口：给定按示值严格递增的校准节点（示值、修正值及
+其标准不确定度）与节点修正值相关矩阵，对待修正示值在相邻节点间线性插值修正值，
+输出示值加修正值；修正值方差由插值权重与节点协方差 $w^{T}\Sigma w$ 计算，示值
+方差贡献为 $(1+\text{修正曲线斜率})^2u^2$，两者独立相加开方得合成标准不确定度，
+并返回所用区间、插值权重与两类方差贡献。
+
 ## 启动
 
 单条命令一键启动（Docker Compose）：
@@ -52,6 +58,7 @@ docker compose up --build
 - `POST /api/v1/propagate-monte-carlo` — 非线性模型的蒙特卡洛传播校核（见下）
 - `POST /api/v1/conformity` — 规格符合性判定（见下）
 - `POST /api/v1/repeatability` — 等间隔重复读数的 A 类标准不确定度（见下）
+- `POST /api/v1/apply-calibration` — 校准修正：相邻节点线性插值 + 节点协方差合成（见下）
 - 交互文档：`http://localhost:8000/docs`
 
 ### 多输出联合传播 `POST /api/v1/propagate-joint`
@@ -428,4 +435,87 @@ $\frac{n-1}{n}\cdot\frac{s^2}{n}$），且恒有 $n_{\mathrm{eff}}=n$。以下�
 | `greater_than_equal` / `int_from_float` 等 Pydantic 错误 | `max_lag` | $L$ 非整数或为负数（须 $L\ge0$） |
 | `lag_too_large` | `max_lag` | $L\ge n$（最大滞后须严格小于读数数量） |
 | `negative_variance_estimate` | `max_lag` | 加窗长程方差显著为负（自协方差估计数值不自洽，建议减小 $L$） |
+
+### 校准修正（线性插值）`POST /api/v1/apply-calibration`
+
+给定按示值**严格递增**的 $n$ 个校准节点（`nodes`，**至少 2 个**），每个节点携带
+示值、修正值及修正值标准不确定度；`correlation_matrix` 为节点修正值相关系数矩阵
+（$n\times n$，顺序与 `nodes` 一致，缺省为单位阵）；`indication` 与
+`indication_standard_uncertainty` 为待修正示值及其标准不确定度。**各量均带单位且
+须同量纲**（支持换算，如节点用 `V`、待修正示值用 `mV`），结果以待修正示值单位为
+显示单位。
+
+设换算后节点为 $(x_i,c_i,u_i)$，待修正示值 $x$ 落在区间 $[x_k,x_{k+1})$ 内
+（**节点处选右侧区间**，即 $x=x_k$ 时取 $[x_k,x_{k+1})$；**末节点选左侧区间**
+$[x_{n-2},x_{n-1}]$），线性插值权重 $t=\frac{x-x_k}{x_{k+1}-x_k}$、
+$w_k=1-t$、$w_{k+1}=t$（其余为 0），修正后结果：
+
+$$
+y=x+c(x),\qquad c(x)=\sum_i w_i c_i
+$$
+
+不确定度合成（**示值误差与节点误差独立**，两类方差相加）：
+
+- **修正值方差**：由插值权重与节点协方差计算，
+  $u^2(c)=w^{T}\Sigma w$，其中 $\Sigma=DRD$、$D=\mathrm{diag}(u_i)$、$R$ 为节点
+  修正值相关系数矩阵；
+- **示值方差贡献**：修正曲线斜率 $s=\frac{c_{k+1}-c_k}{x_{k+1}-x_k}$（无量纲），
+  由 $y=x+c(x)$ 得灵敏度 $1+s$，故 $u^2_x=(1+s)^2u^2(x)$；
+- **合成标准不确定度** $u_c=\sqrt{u^2(c)+u^2_x}$。
+
+响应返回 `result`（$y$、单位、$u_c$）、插值修正值 `correction`、所用区间
+`interval`（左端节点索引与两端示值）、长度等于节点数的插值权重向量 `weights`、
+区间斜率 `slope`，以及两类方差贡献 `correction_variance_contribution` /
+`indication_variance_contribution`（单位均为显示单位的平方）。
+
+请求示例（三节点电压校准，$x=5\,\mathrm{mV}$、$u(x)=0.01\,\mathrm{mV}$；服务地址
+`http://localhost:8000`）：
+
+```bash
+curl -s http://localhost:8000/api/v1/apply-calibration \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "nodes": [
+      {"indication": {"value": 0.0, "unit": "mV"},  "correction": {"value": 0.002, "unit": "mV"},  "correction_standard_uncertainty": {"value": 0.001, "unit": "mV"}},
+      {"indication": {"value": 10.0, "unit": "mV"}, "correction": {"value": -0.004, "unit": "mV"}, "correction_standard_uncertainty": {"value": 0.0015, "unit": "mV"}},
+      {"indication": {"value": 20.0, "unit": "mV"}, "correction": {"value": 0.006, "unit": "mV"},  "correction_standard_uncertainty": {"value": 0.002, "unit": "mV"}}
+    ],
+    "correlation_matrix": [[1.0, 0.5, 0.0], [0.5, 1.0, 0.5], [0.0, 0.5, 1.0]],
+    "indication": {"value": 5.0, "unit": "mV"},
+    "indication_standard_uncertainty": {"value": 0.01, "unit": "mV"}
+  }'
+```
+
+响应（$t=0.5$，$c=-0.001\,\mathrm{mV}$，$s=-0.0006$，$y=4.999\,\mathrm{mV}$；
+$u^2(c)=1.1875\times10^{-6}\,\mathrm{mV^2}$，$u^2_x=(1-0.0006)^2\times10^{-4}
+\approx9.988\times10^{-5}\,\mathrm{mV^2}$，$u_c\approx0.010053\,\mathrm{mV}$）：
+
+```json
+{
+  "result": {"value": 4.999, "unit": "mV", "standard_uncertainty": 0.01005323510120001},
+  "correction": {"value": -0.001, "unit": "mV"},
+  "number_of_nodes": 3,
+  "interval": {
+    "index": 0,
+    "lower": {"value": 0.0, "unit": "mV"},
+    "upper": {"value": 10.0, "unit": "mV"}
+  },
+  "weights": [0.5, 0.5, 0.0],
+  "slope": -0.0006000000000000001,
+  "correction_variance_contribution": {"value": 1.1875e-06, "unit": "mV ** 2"},
+  "indication_variance_contribution": {"value": 9.9880036e-05, "unit": "mV ** 2"},
+  "correlation_matrix": [[1.0, 0.5, 0.0], [0.5, 1.0, 0.5], [0.0, 0.5, 1.0]]
+}
+```
+
+以下情况返回 **422**，错误体带明确 `code` 与 `loc`：
+
+| code | loc | 含义 |
+| --- | --- | --- |
+| `indication_out_of_range` | `indication.value` | 待修正示值超出节点示值范围（`error.details` 给出上下界与单位） |
+| `indication_not_strictly_increasing` | `nodes.<i>.indication.value` | 节点示值未严格递增（定位到首个违例节点） |
+| `incompatible_unit` / `unknown_unit` / `empty_unit` | `nodes.<i>.….unit`、`indication.unit`、`indication_standard_uncertainty.unit` | 单位无法识别或量纲不一致 |
+| `too_short` 等 Pydantic 错误 | `nodes` | 节点少于 2 个 |
+| `greater_than_equal` | `….value` | 标准不确定度为负（须非负） |
+| `bad_matrix_shape` / `correlation_out_of_range` / `diagonal_not_one` / `asymmetric_matrix` / `not_positive_semidefinite` 等 | `correlation_matrix…` | 节点修正值相关矩阵非法（沿用传播接口同一套校验） |
 
