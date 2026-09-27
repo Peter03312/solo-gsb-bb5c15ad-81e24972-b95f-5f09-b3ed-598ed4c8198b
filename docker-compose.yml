@@ -1,0 +1,14 @@
+services:
+  uncertainty-api:
+    build: .
+    container_name: uncertainty-api
+    ports:
+      # 宿主机端口可用环境变量 PORT 覆盖，默认 8000；容器内固定监听 8000。
+      - "${PORT:-8000}:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
