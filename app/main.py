@@ -5,6 +5,7 @@ from fastapi import FastAPI
 from fastapi.exceptions import RequestValidationError
 
 from .allocation import allocate
+from .calibration import apply_calibration
 from .conformity import assess_conformity
 from .errors import UnprocessableError, request_validation_handler, unprocessable_handler
 from .formula import WHITELIST_DISPLAY
@@ -15,6 +16,8 @@ from .repeatability import assess_repeatability
 from .schemas import (
     AllocationRequest,
     AllocationResponse,
+    ApplyCalibrationRequest,
+    ApplyCalibrationResponse,
     ConformityRequest,
     ConformityResponse,
     JointPropagationRequest,
@@ -111,6 +114,29 @@ _REPEATABILITY_EXAMPLE = {
     "readings": [10.00, 10.01, 10.03, 10.02, 10.00, 9.98, 9.99, 10.01],
     "unit": "V",
     "max_lag": 2,
+}
+
+_CALIBRATION_EXAMPLE = {
+    "nodes": [
+        {
+            "indication": {"value": 0.0, "unit": "mV"},
+            "correction": {"value": 0.02, "unit": "mV"},
+            "correction_standard_uncertainty": {"value": 0.004, "unit": "mV"},
+        },
+        {
+            "indication": {"value": 10.0, "unit": "mV"},
+            "correction": {"value": -0.01, "unit": "mV"},
+            "correction_standard_uncertainty": {"value": 0.006, "unit": "mV"},
+        },
+        {
+            "indication": {"value": 20.0, "unit": "mV"},
+            "correction": {"value": 0.03, "unit": "mV"},
+            "correction_standard_uncertainty": {"value": 0.005, "unit": "mV"},
+        },
+    ],
+    "correlation_matrix": [[1.0, 0.5, 0.0], [0.5, 1.0, 0.5], [0.0, 0.5, 1.0]],
+    "indication": {"value": 12.0, "unit": "mV"},
+    "indication_standard_uncertainty": {"value": 0.02, "unit": "mV"},
 }
 
 
@@ -230,3 +256,24 @@ def check_conformity(req: ConformityRequest) -> dict:
 def estimate_repeatability(req: RepeatabilityRequest) -> dict:
     """由等间隔重复读数估计均值的 A 类标准不确定度：1/n 自协方差 + Bartlett 加窗长程方差。"""
     return assess_repeatability(req)
+
+
+@app.post(
+    "/api/v1/apply-calibration",
+    response_model=ApplyCalibrationResponse,
+    tags=["calibration"],
+    responses={
+        422: {
+            "description": (
+                "待修正示值越界 indication_out_of_range / 节点示值非严格递增 "
+                "nodes_not_strictly_increasing，或相关矩阵非法、单位/量纲不兼容等"
+            )
+        }
+    },
+    openapi_extra={
+        "examples": {"三节点 mV 校准修正（线性插值）": {"value": _CALIBRATION_EXAMPLE}},
+    },
+)
+def calibrate(req: ApplyCalibrationRequest) -> dict:
+    """在相邻校准节点间线性插值修正值，输出示值加修正值及合成标准不确定度。"""
+    return apply_calibration(req)

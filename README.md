@@ -25,6 +25,12 @@ A 类标准不确定度 $u_A$（修正序列自相关对朴素 $s/\sqrt n$ 的�
 $u_A$、各滞后 $\gamma_k$ 与有效样本量 $n_{\mathrm{eff}}$；$u_A$ 可直接填入
 `/api/v1/propagate` 的 `standard_uncertainty`。
 
+另提供**校准修正**接口：给定至少两个按示值严格递增的校准节点（示值、修正值及
+其标准不确定度，均带单位）与节点修正值相关矩阵，在相邻节点间**线性插值**修正值，
+输出"示值 + 修正值"；修正值方差由插值权重与节点协方差 $w^{T}\Sigma w$ 给出，
+示值方差贡献为 $(1+\text{修正曲线斜率})^2 u^2$，两类贡献（示值误差与节点误差
+独立）相加开方得合成标准不确定度，并返回所用区间、插值权重与两类方差贡献。
+
 ## 启动
 
 单条命令一键启动（Docker Compose）：
@@ -52,6 +58,7 @@ docker compose up --build
 - `POST /api/v1/propagate-monte-carlo` — 非线性模型的蒙特卡洛传播校核（见下）
 - `POST /api/v1/conformity` — 规格符合性判定（见下）
 - `POST /api/v1/repeatability` — 等间隔重复读数的 A 类标准不确定度（见下）
+- `POST /api/v1/apply-calibration` — 校准修正：相邻节点线性插值 + 不确定度合成（见下）
 - 交互文档：`http://localhost:8000/docs`
 
 ### 多输出联合传播 `POST /api/v1/propagate-joint`
@@ -428,4 +435,84 @@ $\frac{n-1}{n}\cdot\frac{s^2}{n}$），且恒有 $n_{\mathrm{eff}}=n$。以下�
 | `greater_than_equal` / `int_from_float` 等 Pydantic 错误 | `max_lag` | $L$ 非整数或为负数（须 $L\ge0$） |
 | `lag_too_large` | `max_lag` | $L\ge n$（最大滞后须严格小于读数数量） |
 | `negative_variance_estimate` | `max_lag` | 加窗长程方差显著为负（自协方差估计数值不自洽，建议减小 $L$） |
+
+### 校准修正（线性插值）`POST /api/v1/apply-calibration`
+
+给定 $n\ge2$ 个校准节点——每个节点含**示值** $x_i$、**修正值** $c_i$ 及
+**修正值标准不确定度** $u_i$（均带单位，全部量同量纲；节点示值换算到统一单位后
+须**严格递增**）——以及节点修正值相关系数矩阵 $R$（缺省为单位阵），对待修正
+**示值** $x$（带标准不确定度 $u_x$）做修正：
+
+1. **区间选择**：取相邻节点区间 $[x_i,x_{i+1}]$ 使 $x_i\le x\le x_{i+1}$；示值
+   恰好落在节点上时取**右侧**区间，落在末节点时取**左侧**区间（$i=n-2$）；
+2. **线性插值**：$t=\dfrac{x-x_i}{x_{i+1}-x_i}$，修正值
+   $c(x)=(1-t)\,c_i+t\,c_{i+1}$，修正后示值 $y=x+c(x)$；
+3. **修正值方差**：插值权重向量 $w$（仅第 $i$、$i+1$ 两个分量非零）与节点
+   协方差 $\Sigma=DRD$（$D=\mathrm{diag}(u_i)$）给出
+   $u(c)^2=w^{T}\Sigma w$；
+4. **示值方差贡献**：修正曲线在该区间的斜率
+   $s=\dfrac{c_{i+1}-c_i}{x_{i+1}-x_i}$（同量纲相除，无量纲），$y$ 对 $x$ 的
+   灵敏度为 $1+s$，贡献 $(1+s)^2 u_x^2$；**示值误差与节点误差相互独立**，
+   两类方差相加后开方即合成标准不确定度
+   $u_y=\sqrt{u(c)^2+(1+s)^2u_x^2}$。
+
+所有量统一换算到**待修正示值的声明单位**后计算，结果以该单位表示（修正值与
+不确定度按差值量换算，偏移单位如 `degC` 的温差也正确处理；节点示值、修正值等
+可混用 `mV`/`V` 等同量纲单位）。响应返回修正后示值与合成标准不确定度、插值
+修正值及其不确定度、**所用区间**（节点索引与端点示值）、**插值权重**、修正
+曲线斜率，以及**两类方差贡献**与合成方差（单位 = 结果单位的平方）。
+
+请求示例（三个 mV 校准节点，$x=12.0\,\mathrm{mV}$ 落在区间 $[10,20]$ 上，
+$t=0.2$；服务地址 `http://localhost:8000`）：
+
+```bash
+curl -s http://localhost:8000/api/v1/apply-calibration \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "nodes": [
+      {"indication": {"value": 0.0, "unit": "mV"},
+       "correction": {"value": 0.02, "unit": "mV"},
+       "correction_standard_uncertainty": {"value": 0.004, "unit": "mV"}},
+      {"indication": {"value": 10.0, "unit": "mV"},
+       "correction": {"value": -0.01, "unit": "mV"},
+       "correction_standard_uncertainty": {"value": 0.006, "unit": "mV"}},
+      {"indication": {"value": 20.0, "unit": "mV"},
+       "correction": {"value": 0.03, "unit": "mV"},
+       "correction_standard_uncertainty": {"value": 0.005, "unit": "mV"}}
+    ],
+    "correlation_matrix": [[1.0, 0.5, 0.0], [0.5, 1.0, 0.5], [0.0, 0.5, 1.0]],
+    "indication": {"value": 12.0, "unit": "mV"},
+    "indication_standard_uncertainty": {"value": 0.02, "unit": "mV"}
+  }'
+```
+
+响应（$c(x)=0.8\times(-0.01)+0.2\times0.03=-0.002\,\mathrm{mV}$，
+$y=11.998\,\mathrm{mV}$，$s=0.004$，$u(c)^2=2.884\times10^{-5}\,\mathrm{mV^2}$，
+示值贡献 $1.004^2\times0.02^2=4.032064\times10^{-4}\,\mathrm{mV^2}$）：
+
+```json
+{
+  "result": {"value": 11.998, "unit": "mV", "standard_uncertainty": 0.020785725871376254},
+  "correction": {"value": -0.002, "unit": "mV", "standard_uncertainty": 0.005370288632839022},
+  "interval": {"lower_node_index": 1, "upper_node_index": 2, "lower": 10.0, "upper": 20.0, "unit": "mV"},
+  "weights": [{"node_index": 1, "weight": 0.8}, {"node_index": 2, "weight": 0.2}],
+  "correction_curve_slope": 0.004,
+  "correction_variance_contribution": {"value": 2.8840000000000005e-05, "unit": "mV ** 2"},
+  "indication_variance_contribution": {"value": 0.00040320640000000006, "unit": "mV ** 2"},
+  "combined_variance": {"value": 0.0004320464000000001, "unit": "mV ** 2"},
+  "number_of_nodes": 3,
+  "correlation_matrix": [[1.0, 0.5, 0.0], [0.5, 1.0, 0.5], [0.0, 0.5, 1.0]]
+}
+```
+
+以下情况返回 **422**，错误体带明确 `code` 与 `loc`：
+
+| code | loc | 含义 |
+| --- | --- | --- |
+| `indication_out_of_range` | `indication.value` | 待修正示值超出节点示值范围；`error.details` 回显示值、上下界与单位 |
+| `nodes_not_strictly_increasing` | `nodes.<i>.indication.value` | 节点示值（换算到统一单位后）非严格递增 |
+| `incompatible_unit` | 对应字段的 `.unit`（如 `nodes.0.correction.unit`、`indication_standard_uncertainty.unit`） | 某量单位与待修正示值量纲不一致 |
+| `unknown_unit` / `empty_unit` | 对应字段的 `.unit` | 单位无法识别或为空 |
+| `too_short` 等 Pydantic 错误 | `nodes` | 校准节点少于 2 个 |
+| 相关矩阵各 code（`bad_matrix_shape` / `correlation_out_of_range` / `diagonal_not_one` / `asymmetric_matrix` / `not_positive_semidefinite` 等） | `correlation_matrix…` | 节点修正值相关矩阵非法，沿用传播接口同一套校验与 loc |
 

@@ -1479,4 +1479,312 @@ for body, field in [
     r = client.post("/api/v1/repeatability", json=body)
     assert r.status_code == 422 and r.json()["error"]["loc"] == [field], body
 
+# --- POST /api/v1/apply-calibration -----------------------------------------
+
+# 三节点 mV 示例：x=[0,10,20], c=[0.02,-0.01,0.03], u=[0.004,0.006,0.005]
+_CAL_NODES = [
+    {"indication": {"value": 0.0, "unit": "mV"},
+     "correction": {"value": 0.02, "unit": "mV"},
+     "correction_standard_uncertainty": {"value": 0.004, "unit": "mV"}},
+    {"indication": {"value": 10.0, "unit": "mV"},
+     "correction": {"value": -0.01, "unit": "mV"},
+     "correction_standard_uncertainty": {"value": 0.006, "unit": "mV"}},
+    {"indication": {"value": 20.0, "unit": "mV"},
+     "correction": {"value": 0.03, "unit": "mV"},
+     "correction_standard_uncertainty": {"value": 0.005, "unit": "mV"}},
+]
+_CAL_CORR = [[1.0, 0.5, 0.0], [0.5, 1.0, 0.5], [0.0, 0.5, 1.0]]
+_CAL_BASE = {
+    "nodes": _CAL_NODES,
+    "correlation_matrix": _CAL_CORR,
+    "indication": {"value": 12.0, "unit": "mV"},
+    "indication_standard_uncertainty": {"value": 0.02, "unit": "mV"},
+}
+
+# 75) 基本示例：x=12 -> 区间 [10,20]，t=0.2，权重 0.8/0.2
+#   c = 0.8*(-0.01)+0.2*0.03 = -0.002；y = 12 - 0.002 = 11.998
+#   slope = 0.04/10 = 0.004；u(c)^2 = 0.64*3.6e-5 + 0.04*2.5e-5 + 2*0.8*0.2*0.006*0.005*0.5
+#         = 2.884e-5；u_x 贡献 = 1.004^2 * 4e-4 = 4.032064e-4
+r = client.post("/api/v1/apply-calibration", json=_CAL_BASE)
+show("75) apply-calibration x=12 mV (y=11.998, uc=sqrt(4.320464e-4))", r.json())
+assert r.status_code == 200, r.text
+b = r.json()
+assert b["result"]["unit"] == "mV"
+assert abs(b["result"]["value"] - 11.998) < 1e-12
+assert b["correction"]["value"] == -0.002
+assert b["interval"] == {
+    "lower_node_index": 1, "upper_node_index": 2,
+    "lower": 10.0, "upper": 20.0, "unit": "mV",
+}
+assert b["weights"] == [
+    {"node_index": 1, "weight": 0.8},
+    {"node_index": 2, "weight": 0.2},
+]
+assert abs(b["correction_curve_slope"] - 0.004) < 1e-15
+_cv = 2.884e-5
+_iv = 1.004 ** 2 * 0.0004
+assert abs(b["correction_variance_contribution"]["value"] - _cv) < 1e-18
+assert abs(b["indication_variance_contribution"]["value"] - _iv) < 1e-18
+assert b["correction_variance_contribution"]["unit"] == "mV ** 2"
+assert abs(b["combined_variance"]["value"] - (_cv + _iv)) < 1e-18
+assert abs(b["result"]["standard_uncertainty"] - math.sqrt(_cv + _iv)) < 1e-15
+assert abs(b["correction"]["standard_uncertainty"] - math.sqrt(_cv)) < 1e-15
+assert b["number_of_nodes"] == 3
+assert b["correlation_matrix"] == _CAL_CORR
+
+# 76) 示值落在中间节点 -> 右侧区间 [10,20]，权重 [1,0]，修正值即该节点修正值
+r = client.post("/api/v1/apply-calibration",
+                json={**_CAL_BASE, "indication": {"value": 10.0, "unit": "mV"}})
+show("76) x=10 exactly -> right interval [10,20]", r.json())
+assert r.status_code == 200, r.text
+b = r.json()
+assert (b["interval"]["lower_node_index"], b["interval"]["upper_node_index"]) == (1, 2)
+assert b["weights"] == [
+    {"node_index": 1, "weight": 1.0},
+    {"node_index": 2, "weight": 0.0},
+]
+assert b["correction"]["value"] == -0.01
+assert abs(b["correction_variance_contribution"]["value"] - 0.006 ** 2) < 1e-18
+assert abs(b["result"]["value"] - 9.99) < 1e-12
+
+# 77) 示值落在末节点 -> 左侧区间 [10,20]，权重 [0,1]
+r = client.post("/api/v1/apply-calibration",
+                json={**_CAL_BASE, "indication": {"value": 20.0, "unit": "mV"}})
+show("77) x=20 (last node) -> left interval [10,20]", r.json())
+assert r.status_code == 200, r.text
+b = r.json()
+assert (b["interval"]["lower_node_index"], b["interval"]["upper_node_index"]) == (1, 2)
+assert b["weights"] == [
+    {"node_index": 1, "weight": 0.0},
+    {"node_index": 2, "weight": 1.0},
+]
+assert b["correction"]["value"] == 0.03
+assert abs(b["correction_variance_contribution"]["value"] - 0.005 ** 2) < 1e-18
+assert abs(b["result"]["value"] - 20.03) < 1e-12
+
+# 78) 示值落在首节点 -> 右侧区间 [0,10]，权重 [1,0]
+r = client.post("/api/v1/apply-calibration",
+                json={**_CAL_BASE, "indication": {"value": 0.0, "unit": "mV"}})
+show("78) x=0 (first node) -> right interval [0,10]", r.json())
+assert r.status_code == 200, r.text
+b = r.json()
+assert (b["interval"]["lower_node_index"], b["interval"]["upper_node_index"]) == (0, 1)
+assert b["weights"] == [
+    {"node_index": 0, "weight": 1.0},
+    {"node_index": 1, "weight": 0.0},
+]
+assert b["correction"]["value"] == 0.02
+assert abs(b["result"]["value"] - 0.02) < 1e-12
+
+# 79) 越界示值 -> 422 indication_out_of_range，loc 与 details 定位明确
+for bad_x in (-0.1, 20.1, 100.0):
+    r = client.post("/api/v1/apply-calibration",
+                    json={**_CAL_BASE, "indication": {"value": bad_x, "unit": "mV"}})
+    show(f"79) x={bad_x} out of range -> 422", r.json())
+    assert r.status_code == 422
+    err = r.json()["error"]
+    assert err["code"] == "indication_out_of_range"
+    assert err["loc"] == ["indication", "value"]
+    assert err["details"]["lower"] == 0.0 and err["details"]["upper"] == 20.0
+    assert err["details"]["indication"] == bad_x and err["details"]["unit"] == "mV"
+
+# 80) 节点示值非严格递增（含相等）-> 422 定位到后一节点示值
+_bad_nodes = [dict(_CAL_NODES[0]), dict(_CAL_NODES[1]),
+              {"indication": {"value": 10.0, "unit": "mV"},
+               "correction": {"value": 0.03, "unit": "mV"},
+               "correction_standard_uncertainty": {"value": 0.005, "unit": "mV"}}]
+r = client.post("/api/v1/apply-calibration", json={**_CAL_BASE, "nodes": _bad_nodes})
+show("80) equal node indications -> 422", r.json())
+assert r.status_code == 422
+assert r.json()["error"]["code"] == "nodes_not_strictly_increasing"
+assert r.json()["error"]["loc"] == ["nodes", 2, "indication", "value"]
+_bad_nodes[2]["indication"] = {"value": 5.0, "unit": "mV"}  # 递减也不行
+r = client.post("/api/v1/apply-calibration", json={**_CAL_BASE, "nodes": _bad_nodes})
+assert r.status_code == 422
+assert r.json()["error"]["code"] == "nodes_not_strictly_increasing"
+
+# 81) 单位换算：节点/示值混用 mV 与 V，结果以示值单位 V 表示
+r = client.post(
+    "/api/v1/apply-calibration",
+    json={
+        "nodes": [
+            _CAL_NODES[0],
+            {"indication": {"value": 0.01, "unit": "V"},
+             "correction": {"value": -0.01, "unit": "mV"},
+             "correction_standard_uncertainty": {"value": 0.006, "unit": "mV"}},
+            {"indication": {"value": 20.0, "unit": "mV"},
+             "correction": {"value": 0.00003, "unit": "V"},
+             "correction_standard_uncertainty": {"value": 0.005, "unit": "mV"}},
+        ],
+        "correlation_matrix": _CAL_CORR,
+        "indication": {"value": 0.012, "unit": "V"},
+        "indication_standard_uncertainty": {"value": 0.00002, "unit": "V"},
+    },
+)
+show("81) mixed mV/V units -> result in V", r.json())
+assert r.status_code == 200, r.text
+b = r.json()
+assert b["result"]["unit"] == "V"
+assert abs(b["result"]["value"] - 0.011998) < 1e-15
+assert abs(b["correction"]["value"] - (-2e-6)) < 1e-18
+assert abs(b["correction_curve_slope"] - 0.004) < 1e-15
+assert abs(b["correction_variance_contribution"]["value"] - 2.884e-11) < 1e-24
+assert abs(b["indication_variance_contribution"]["value"] - 1.004 ** 2 * 4e-10) < 1e-24
+assert abs(b["result"]["standard_uncertainty"] - math.sqrt(4.320464e-10)) < 1e-18
+
+# 82) 量纲不一致 -> 422 incompatible_unit，loc 定位到具体字段
+r = client.post(
+    "/api/v1/apply-calibration",
+    json={**_CAL_BASE, "nodes": [
+        {"indication": {"value": 0.0, "unit": "mV"},
+         "correction": {"value": 0.02, "unit": "A"},
+         "correction_standard_uncertainty": {"value": 0.004, "unit": "mV"}},
+        *_CAL_NODES[1:],
+    ]},
+)
+show("82) correction unit A vs mV -> 422", r.json())
+assert r.status_code == 422
+assert r.json()["error"]["code"] == "incompatible_unit"
+assert r.json()["error"]["loc"] == ["nodes", 0, "correction", "unit"]
+r = client.post(
+    "/api/v1/apply-calibration",
+    json={**_CAL_BASE,
+          "indication_standard_uncertainty": {"value": 0.02, "unit": "s"}},
+)
+assert r.status_code == 422
+assert r.json()["error"]["code"] == "incompatible_unit"
+assert r.json()["error"]["loc"] == ["indication_standard_uncertainty", "unit"]
+r = client.post(
+    "/api/v1/apply-calibration",
+    json={**_CAL_BASE, "nodes": [
+        {"indication": {"value": 0.0, "unit": "s"},
+         "correction": {"value": 0.02, "unit": "mV"},
+         "correction_standard_uncertainty": {"value": 0.004, "unit": "mV"}},
+        *_CAL_NODES[1:],
+    ]},
+)
+assert r.status_code == 422
+assert r.json()["error"]["loc"] == ["nodes", 0, "indication", "unit"]
+
+# 83) 相关矩阵校验复用：形状 / 越界 / 非半正定；缺省为单位阵
+r = client.post("/api/v1/apply-calibration",
+                json={**_CAL_BASE, "correlation_matrix": [[1.0, 0.5], [0.5, 1.0]]})
+show("83) 2x2 matrix for 3 nodes -> 422", r.json())
+assert r.status_code == 422
+assert r.json()["error"]["code"] == "bad_matrix_shape"
+assert r.json()["error"]["loc"] == ["correlation_matrix"]
+r = client.post(
+    "/api/v1/apply-calibration",
+    json={**_CAL_BASE,
+          "correlation_matrix": [[1.0, 1.2, 0.0], [1.2, 1.0, 0.5], [0.0, 0.5, 1.0]]},
+)
+assert r.status_code == 422
+assert r.json()["error"]["code"] == "correlation_out_of_range"
+assert r.json()["error"]["loc"] == ["correlation_matrix", 0, 1]
+r = client.post(
+    "/api/v1/apply-calibration",
+    json={**_CAL_BASE,
+          "correlation_matrix": [[1.0, 0.9, 0.9], [0.9, 1.0, -0.9], [0.9, -0.9, 1.0]]},
+)
+assert r.status_code == 422
+assert r.json()["error"]["code"] == "not_positive_semidefinite"
+# 缺省矩阵 = 单位阵：u(c)^2 = 0.64*3.6e-5 + 0.04*2.5e-5 = 2.404e-5
+r = client.post("/api/v1/apply-calibration",
+                json={k: v for k, v in _CAL_BASE.items() if k != "correlation_matrix"})
+show("83b) default identity correlation", r.json())
+assert r.status_code == 200, r.text
+b = r.json()
+assert b["correlation_matrix"] == [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+assert abs(b["correction_variance_contribution"]["value"] - 2.404e-5) < 1e-18
+
+# 84) 两节点完全负相关、等不确定度：中点处修正值方差为 0
+r = client.post(
+    "/api/v1/apply-calibration",
+    json={
+        "nodes": [
+            {"indication": {"value": 0.0, "unit": "m"},
+             "correction": {"value": 0.0, "unit": "m"},
+             "correction_standard_uncertainty": {"value": 0.01, "unit": "m"}},
+            {"indication": {"value": 10.0, "unit": "m"},
+             "correction": {"value": 0.0, "unit": "m"},
+             "correction_standard_uncertainty": {"value": 0.01, "unit": "m"}},
+        ],
+        "correlation_matrix": [[1.0, -1.0], [-1.0, 1.0]],
+        "indication": {"value": 5.0, "unit": "m"},
+        "indication_standard_uncertainty": {"value": 0.0, "unit": "m"},
+    },
+)
+show("84) r=-1 equal u at midpoint -> zero variances", r.json())
+assert r.status_code == 200, r.text
+b = r.json()
+assert b["correction_variance_contribution"]["value"] == 0.0
+assert b["indication_variance_contribution"]["value"] == 0.0
+assert b["combined_variance"]["value"] == 0.0
+assert b["result"]["standard_uncertainty"] == 0.0
+
+# 85) 节点少于 2 个 -> 422 loc nodes（Pydantic）
+r = client.post("/api/v1/apply-calibration",
+                json={**_CAL_BASE, "nodes": _CAL_NODES[:1]})
+show("85) single node -> 422", r.json())
+assert r.status_code == 422 and r.json()["error"]["loc"] == ["nodes"]
+
+# 86) 未知单位 / 负不确定度 -> 422 定位到字段
+r = client.post("/api/v1/apply-calibration",
+                json={**_CAL_BASE, "indication": {"value": 12.0, "unit": "frobnicate"}})
+show("86) unknown unit -> 422", r.json())
+assert r.status_code == 422
+assert r.json()["error"]["code"] == "unknown_unit"
+assert r.json()["error"]["loc"] == ["indication", "unit"]
+r = client.post(
+    "/api/v1/apply-calibration",
+    json={**_CAL_BASE, "nodes": [
+        {"indication": {"value": 0.0, "unit": "mV"},
+         "correction": {"value": 0.02, "unit": "mV"},
+         "correction_standard_uncertainty": {"value": -0.004, "unit": "mV"}},
+        *_CAL_NODES[1:],
+    ]},
+)
+assert r.status_code == 422
+assert r.json()["error"]["loc"] == ["nodes", 0, "correction_standard_uncertainty", "value"]
+
+# 87) 偏移单位 degC：差值量按温差换算（修正值可用 K 表示），结果单位 °C
+r = client.post(
+    "/api/v1/apply-calibration",
+    json={
+        "nodes": [
+            {"indication": {"value": 20.0, "unit": "degC"},
+             "correction": {"value": 0.1, "unit": "K"},
+             "correction_standard_uncertainty": {"value": 0.01, "unit": "degC"}},
+            {"indication": {"value": 30.0, "unit": "degC"},
+             "correction": {"value": 0.3, "unit": "degC"},
+             "correction_standard_uncertainty": {"value": 0.02, "unit": "K"}},
+        ],
+        "indication": {"value": 25.0, "unit": "degC"},
+        "indication_standard_uncertainty": {"value": 0.05, "unit": "degC"},
+    },
+)
+show("87) degC offset unit (correction in K as difference)", r.json())
+assert r.status_code == 200, r.text
+b = r.json()
+assert b["result"]["unit"] == "°C"
+assert abs(b["result"]["value"] - 25.2) < 1e-12
+assert abs(b["correction"]["value"] - 0.2) < 1e-12
+assert abs(b["correction_curve_slope"] - 0.02) < 1e-15
+_cv = 0.25 * 1e-4 + 0.25 * 4e-4
+_iv = 1.02 ** 2 * 0.0025
+assert abs(b["correction_variance_contribution"]["value"] - _cv) < 1e-18
+assert abs(b["indication_variance_contribution"]["value"] - _iv) < 1e-18
+assert b["correction_variance_contribution"]["unit"] == "°C ** 2"
+assert abs(b["result"]["standard_uncertainty"] - math.sqrt(_cv + _iv)) < 1e-15
+
+# 88) 合成关系：combined = 两类贡献之和，u = sqrt(combined)（对任意合法请求成立）
+r = client.post("/api/v1/apply-calibration", json=_CAL_BASE)
+b = r.json()
+assert abs(
+    b["combined_variance"]["value"]
+    - (b["correction_variance_contribution"]["value"]
+       + b["indication_variance_contribution"]["value"])
+) < 1e-30
+assert abs(b["result"]["standard_uncertainty"] - math.sqrt(b["combined_variance"]["value"])) < 1e-18
+
 print("\nALL TESTS PASSED")

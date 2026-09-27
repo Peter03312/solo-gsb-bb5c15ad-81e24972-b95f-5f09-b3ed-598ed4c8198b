@@ -494,3 +494,103 @@ class RepeatabilityResponse(BaseModel):
         ...,
         description="有效样本量 n_eff = n γ_0 / [γ_0 + 2 Σ…]；分母为零时为 null",
     )
+
+
+# -- 校准修正（相邻节点线性插值）---------------------------------------------
+
+
+class CalibrationQuantity(BaseModel):
+    """带单位的量（示值/修正值）；单位须与待修正示值同量纲。"""
+
+    value: FiniteFloat
+    unit: str = Field(..., min_length=1, description="量的单位，如 mV / V / mm")
+
+
+class CalibrationUncertainty(BaseModel):
+    """带单位的标准不确定度（非负）；单位须与待修正示值同量纲。"""
+
+    value: NonNegFiniteFloat
+    unit: str = Field(..., min_length=1, description="标准不确定度单位")
+
+
+class CalibrationNode(BaseModel):
+    """单个校准节点：示值、修正值及修正值的标准不确定度（均带单位）。"""
+
+    indication: CalibrationQuantity = Field(..., description="节点示值（带单位）")
+    correction: CalibrationQuantity = Field(..., description="节点修正值（带单位）")
+    correction_standard_uncertainty: CalibrationUncertainty = Field(
+        ..., description="节点修正值的标准不确定度（带单位）"
+    )
+
+
+class ApplyCalibrationRequest(BaseModel):
+    """校准修正请求：校准节点序列 + 节点修正值相关矩阵 + 待修正示值。"""
+
+    nodes: list[CalibrationNode] = Field(
+        ...,
+        min_length=2,
+        description="至少 2 个校准节点；示值（换算到统一单位后）须严格递增",
+    )
+    correlation_matrix: list[list[FiniteFloat]] | None = Field(
+        default=None,
+        description="节点修正值相关系数矩阵，顺序与 nodes 一致；缺省为单位阵（互不相关）",
+    )
+    indication: CalibrationQuantity = Field(
+        ..., description="待修正示值（带单位）；结果以该单位表示"
+    )
+    indication_standard_uncertainty: CalibrationUncertainty = Field(
+        ..., description="待修正示值的标准不确定度（带单位）"
+    )
+
+
+class CalibrationInterval(BaseModel):
+    """实际使用的相邻节点区间（节点处取右侧区间，末节点取左侧区间）。"""
+
+    lower_node_index: int = Field(..., description="区间左端节点索引（从 0 开始）")
+    upper_node_index: int = Field(..., description="区间右端节点索引（从 0 开始）")
+    lower: float = Field(..., description="区间左端示值（结果单位）")
+    upper: float = Field(..., description="区间右端示值（结果单位）")
+    unit: str
+
+
+class CalibrationWeight(BaseModel):
+    """插值权重：修正值 = Σ weight × 节点修正值（仅所用区间两端节点非零）。"""
+
+    node_index: int = Field(..., description="节点索引（从 0 开始）")
+    weight: float = Field(..., description="该节点修正值的插值权重")
+
+
+class CalibrationVariance(BaseModel):
+    """一方差贡献：数值 + 单位（单位为结果单位的平方）。"""
+
+    value: float
+    unit: str
+
+
+class ApplyCalibrationResponse(BaseModel):
+    """校准修正响应：修正后示值、合成标准不确定度、所用区间/权重与方差分解。"""
+
+    result: QuantityResult = Field(
+        ..., description="修正后示值 = 待修正示值 + 插值修正值，及合成标准不确定度"
+    )
+    correction: QuantityResult = Field(
+        ..., description="插值修正值及其标准不确定度（wᵀΣw 开方）"
+    )
+    interval: CalibrationInterval
+    weights: list[CalibrationWeight]
+    correction_curve_slope: float = Field(
+        ..., description="所用区间修正曲线斜率 dc/dx（同量纲相除，无量纲）"
+    )
+    correction_variance_contribution: CalibrationVariance = Field(
+        ..., description="修正值方差贡献 wᵀΣw（插值权重 × 节点协方差）"
+    )
+    indication_variance_contribution: CalibrationVariance = Field(
+        ..., description="示值方差贡献 (1+修正曲线斜率)²·u²"
+    )
+    combined_variance: CalibrationVariance = Field(
+        ..., description="合成方差 = 两类方差贡献之和（示值误差与节点误差独立）"
+    )
+    number_of_nodes: int = Field(..., description="参与插值的校准节点数量")
+    correlation_matrix: list[list[float]] = Field(
+        ..., description="节点修正值相关系数矩阵（回显，顺序与 nodes 一致）"
+    )
